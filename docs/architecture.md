@@ -13,6 +13,7 @@ One Go engine owns virtual time, action validation, state reduction, event stora
 - Evaluation sees truth only after a run is complete and its seal verifies.
 - Run IDs are reserved atomically and are never overwritten. A seal binds the run specification, behavior bundle, event streams, decision trace, counts, and completion state.
 - Replay verifies the source seal and complete decision trace, then recomputes derived output under the same supported behavior bundle. Unsupported bundles fail closed. Replay does not rerun Python.
+- If final seal publication succeeds but directory synchronization reports an error, the result is indeterminate; verify the same run ID before retrying.
 
 Determinism is guaranteed for the same complete recorded decision trace and behavior bundle. Host-dependent subprocess timeouts can change a live run and are recorded as explicit faults; identical run specifications alone do not promise identical live outcomes.
 
