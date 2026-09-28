@@ -34,6 +34,14 @@ type RunStore struct {
 	root string
 }
 
+type VerifiedRun struct {
+	Spec         RunSpec
+	Seal         RunSeal
+	PublicEvents []PublicEvent
+	TruthRecords []TruthRecord
+	Decisions    []DecisionRecord
+}
+
 type streamWriter struct {
 	file  *os.File
 	name  string
@@ -297,51 +305,60 @@ func (w *RunWriter) closeStreams() error {
 }
 
 func (s *RunStore) Verify(id RunID) (RunSeal, error) {
+	verified, err := s.verify(id, false)
+	return verified.Seal, err
+}
+
+func (s *RunStore) ReadVerifiedRun(id RunID) (VerifiedRun, error) {
+	return s.verify(id, true)
+}
+
+func (s *RunStore) verify(id RunID, collect bool) (VerifiedRun, error) {
 	if s == nil {
-		return RunSeal{}, errors.New("run store is nil")
+		return VerifiedRun{}, errors.New("run store is nil")
 	}
 	if _, err := ParseRunID(string(id)); err != nil {
-		return RunSeal{}, err
+		return VerifiedRun{}, err
 	}
 	dir := filepath.Join(s.root, string(id))
 	sealPath := filepath.Join(dir, "seal.json")
 	if _, err := os.Stat(sealPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return RunSeal{}, ErrIncompleteRun
+			return VerifiedRun{}, ErrIncompleteRun
 		}
-		return RunSeal{}, err
+		return VerifiedRun{}, err
 	}
 	var spec RunSpec
 	if err := readCanonical(filepath.Join(dir, "spec.json"), &spec); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return RunSeal{}, fmt.Errorf("%w: missing run spec", ErrIntegrity)
+			return VerifiedRun{}, fmt.Errorf("%w: missing run spec", ErrIntegrity)
 		}
-		return RunSeal{}, fmt.Errorf("%w: read run spec: %v", ErrIntegrity, err)
+		return VerifiedRun{}, fmt.Errorf("%w: read run spec: %v", ErrIntegrity, err)
 	}
 	if err := spec.Validate(); err != nil || spec.RunID != id {
-		return RunSeal{}, fmt.Errorf("%w: invalid run spec", ErrIntegrity)
+		return VerifiedRun{}, fmt.Errorf("%w: invalid run spec", ErrIntegrity)
 	}
 	var seal RunSeal
 	if err := readCanonical(sealPath, &seal); err != nil {
-		return RunSeal{}, fmt.Errorf("%w: read seal: %v", ErrIntegrity, err)
+		return VerifiedRun{}, fmt.Errorf("%w: read seal: %v", ErrIntegrity, err)
 	}
 	specBytes, err := json.Marshal(spec)
 	if err != nil {
-		return RunSeal{}, fmt.Errorf("encode verified run spec: %w", err)
+		return VerifiedRun{}, fmt.Errorf("encode verified run spec: %w", err)
 	}
 	bundleDigest, err := spec.BehaviorBundle.Digest()
 	if err != nil {
-		return RunSeal{}, fmt.Errorf("%w: invalid behavior bundle", ErrIntegrity)
+		return VerifiedRun{}, fmt.Errorf("%w: invalid behavior bundle", ErrIntegrity)
 	}
 	if seal.SpecDigest != digestBytes(specBytes) || seal.BehaviorBundleDigest != bundleDigest {
-		return RunSeal{}, fmt.Errorf("%w: spec or behavior bundle digest mismatch", ErrIntegrity)
+		return VerifiedRun{}, fmt.Errorf("%w: spec or behavior bundle digest mismatch", ErrIntegrity)
 	}
 
 	actorPolicies := make(map[ActorID]PolicyID, len(spec.Actors))
 	for _, actor := range spec.Actors {
 		actorPolicies[actor.ID] = actor.Policy.ID
 	}
-	publicHead, publicCount, err := verifyStream[PublicEvent](filepath.Join(dir, "public.jsonl"), func(event PublicEvent) error {
+	publicHead, publicCount, publicEvents, err := verifyStream[PublicEvent](filepath.Join(dir, "public.jsonl"), func(event PublicEvent) error {
 		if err := event.Validate(); err != nil {
 			return err
 		}
@@ -349,11 +366,11 @@ func (s *RunStore) Verify(id RunID) (RunSeal, error) {
 			return fmt.Errorf("%w: public event exceeds run contract", ErrInvalidRecord)
 		}
 		return nil
-	})
+	}, collect)
 	if err != nil {
-		return RunSeal{}, err
+		return VerifiedRun{}, err
 	}
-	truthHead, truthCount, err := verifyStream[TruthRecord](filepath.Join(dir, "truth.jsonl"), func(record TruthRecord) error {
+	truthHead, truthCount, truthRecords, err := verifyStream[TruthRecord](filepath.Join(dir, "truth.jsonl"), func(record TruthRecord) error {
 		if err := record.Validate(); err != nil {
 			return err
 		}
@@ -361,16 +378,16 @@ func (s *RunStore) Verify(id RunID) (RunSeal, error) {
 			return fmt.Errorf("%w: truth record exceeds run contract", ErrInvalidRecord)
 		}
 		return nil
-	})
+	}, collect)
 	if err != nil {
-		return RunSeal{}, err
+		return VerifiedRun{}, err
 	}
 	type actorTick struct {
 		actor ActorID
 		tick  uint64
 	}
 	seenDecisions := make(map[actorTick]struct{})
-	decisionHead, decisionCount, err := verifyStream[DecisionRecord](filepath.Join(dir, "decisions.jsonl"), func(record DecisionRecord) error {
+	decisionHead, decisionCount, decisions, err := verifyStream[DecisionRecord](filepath.Join(dir, "decisions.jsonl"), func(record DecisionRecord) error {
 		if err := record.Validate(); err != nil {
 			return err
 		}
@@ -383,82 +400,87 @@ func (s *RunStore) Verify(id RunID) (RunSeal, error) {
 		}
 		seenDecisions[key] = struct{}{}
 		return nil
-	})
+	}, collect)
 	if err != nil {
-		return RunSeal{}, err
+		return VerifiedRun{}, err
 	}
+	verified := VerifiedRun{Spec: spec, Seal: seal, PublicEvents: publicEvents, TruthRecords: truthRecords, Decisions: decisions}
 	if publicHead != seal.PublicHead || publicCount != seal.PublicCount || truthHead != seal.TruthHead || truthCount != seal.TruthCount || decisionHead != seal.DecisionHead || decisionCount != seal.DecisionCount {
-		return RunSeal{}, fmt.Errorf("%w: stream head or count mismatch", ErrIntegrity)
+		return VerifiedRun{}, fmt.Errorf("%w: stream head or count mismatch", ErrIntegrity)
 	}
 	if seal.Completed && decisionCount == 0 {
-		return RunSeal{}, fmt.Errorf("%w: completed run has no decision trace", ErrIntegrity)
+		return VerifiedRun{}, fmt.Errorf("%w: completed run has no decision trace", ErrIntegrity)
 	}
 	if !seal.Completed {
-		return seal, ErrIncompleteRun
+		return verified, ErrIncompleteRun
 	}
-	return seal, nil
+	return verified, nil
 }
 
-func verifyStream[T any](path string, validate func(T) error) (string, uint64, error) {
+func verifyStream[T any](path string, validate func(T) error, collect bool) (string, uint64, []T, error) {
 	contents, err := readLimited(path, maxStreamBytes)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return "", 0, fmt.Errorf("%w: missing sealed stream %s", ErrIntegrity, filepath.Base(path))
+			return "", 0, nil, fmt.Errorf("%w: missing sealed stream %s", ErrIntegrity, filepath.Base(path))
 		}
 		if errors.Is(err, ErrFileTooLarge) {
-			return "", 0, fmt.Errorf("%w: %v", ErrIntegrity, err)
+			return "", 0, nil, fmt.Errorf("%w: %v", ErrIntegrity, err)
 		}
-		return "", 0, err
+		return "", 0, nil, err
 	}
 	if len(contents) == 0 {
-		return "", 0, nil
+		return "", 0, nil, nil
 	}
 	if contents[len(contents)-1] != '\n' {
-		return "", 0, fmt.Errorf("%w: stream %s is truncated", ErrIntegrity, filepath.Base(path))
+		return "", 0, nil, fmt.Errorf("%w: stream %s is truncated", ErrIntegrity, filepath.Base(path))
 	}
 	if bytes.Contains(contents, []byte{'\r'}) {
-		return "", 0, fmt.Errorf("%w: carriage returns in canonical stream", ErrIntegrity)
+		return "", 0, nil, fmt.Errorf("%w: carriage returns in canonical stream", ErrIntegrity)
 	}
 	scanner := bufio.NewScanner(bytes.NewReader(contents))
 	scanner.Buffer(make([]byte, 64*1024), maxStreamBytes)
 	var head string
 	var count uint64
+	var records []T
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		var entry chainEnvelope
 		if err := decodeStrict(line, &entry); err != nil {
-			return "", 0, fmt.Errorf("%w: decode %s entry: %v", ErrIntegrity, filepath.Base(path), err)
+			return "", 0, nil, fmt.Errorf("%w: decode %s entry: %v", ErrIntegrity, filepath.Base(path), err)
 		}
 		canonicalEntry, err := json.Marshal(entry)
 		if err != nil || !bytes.Equal(canonicalEntry, line) {
-			return "", 0, fmt.Errorf("%w: non-canonical %s entry", ErrIntegrity, filepath.Base(path))
+			return "", 0, nil, fmt.Errorf("%w: non-canonical %s entry", ErrIntegrity, filepath.Base(path))
 		}
 		if entry.Sequence != count+1 || entry.PreviousHash != head || len(entry.Payload) == 0 {
-			return "", 0, fmt.Errorf("%w: broken sequence in %s", ErrIntegrity, filepath.Base(path))
+			return "", 0, nil, fmt.Errorf("%w: broken sequence in %s", ErrIntegrity, filepath.Base(path))
 		}
 		var payload T
 		if err := decodeStrict(entry.Payload, &payload); err != nil {
-			return "", 0, fmt.Errorf("%w: decode %s payload: %v", ErrIntegrity, filepath.Base(path), err)
+			return "", 0, nil, fmt.Errorf("%w: decode %s payload: %v", ErrIntegrity, filepath.Base(path), err)
 		}
 		canonicalPayload, err := json.Marshal(payload)
 		if err != nil || !bytes.Equal(canonicalPayload, entry.Payload) {
-			return "", 0, fmt.Errorf("%w: non-canonical %s payload", ErrIntegrity, filepath.Base(path))
+			return "", 0, nil, fmt.Errorf("%w: non-canonical %s payload", ErrIntegrity, filepath.Base(path))
 		}
 		if err := validate(payload); err != nil {
-			return "", 0, fmt.Errorf("%w: invalid %s payload: %v", ErrIntegrity, filepath.Base(path), err)
+			return "", 0, nil, fmt.Errorf("%w: invalid %s payload: %v", ErrIntegrity, filepath.Base(path), err)
 		}
 		body := chainBody{Sequence: entry.Sequence, PreviousHash: entry.PreviousHash, Payload: entry.Payload}
 		encodedBody, err := json.Marshal(body)
 		if err != nil || digestBytes(encodedBody) != entry.Hash {
-			return "", 0, fmt.Errorf("%w: hash mismatch in %s", ErrIntegrity, filepath.Base(path))
+			return "", 0, nil, fmt.Errorf("%w: hash mismatch in %s", ErrIntegrity, filepath.Base(path))
 		}
 		head = entry.Hash
 		count++
+		if collect {
+			records = append(records, payload)
+		}
 	}
 	if err := scanner.Err(); err != nil {
-		return "", 0, fmt.Errorf("%w: read %s: %v", ErrIntegrity, filepath.Base(path), err)
+		return "", 0, nil, fmt.Errorf("%w: read %s: %v", ErrIntegrity, filepath.Base(path), err)
 	}
-	return head, count, nil
+	return head, count, records, nil
 }
 
 func (e PublicEvent) Validate() error {

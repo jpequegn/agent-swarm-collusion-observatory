@@ -89,19 +89,29 @@ type RunLimits struct {
 }
 
 type RunSpec struct {
-	RunID           RunID          `json:"run_id"`
-	ScenarioID      string         `json:"scenario_id"`
-	Topology        Topology       `json:"topology"`
-	Seed            int64          `json:"seed"`
-	BehaviorBundle  BehaviorBundle `json:"behavior_bundle"`
-	ProtocolVersion uint32         `json:"protocol_version"`
-	Actors          []ActorSpec    `json:"actors"`
-	Limits          RunLimits      `json:"limits"`
+	RunID            RunID          `json:"run_id"`
+	SourceRunID      RunID          `json:"source_run_id,omitempty"`
+	SourceSealDigest string         `json:"source_seal_digest,omitempty"`
+	ScenarioID       string         `json:"scenario_id"`
+	Topology         Topology       `json:"topology"`
+	Seed             int64          `json:"seed"`
+	BehaviorBundle   BehaviorBundle `json:"behavior_bundle"`
+	ProtocolVersion  uint32         `json:"protocol_version"`
+	Actors           []ActorSpec    `json:"actors"`
+	Limits           RunLimits      `json:"limits"`
 }
 
 func (s RunSpec) Validate() error {
 	if _, err := ParseRunID(string(s.RunID)); err != nil {
 		return err
+	}
+	if s.SourceRunID == "" && s.SourceSealDigest != "" || s.SourceRunID != "" && (s.SourceRunID == s.RunID || !isDigest(s.SourceSealDigest)) {
+		return fmt.Errorf("%w: invalid replay provenance", ErrInvalidRecord)
+	}
+	if s.SourceRunID != "" {
+		if _, err := ParseRunID(string(s.SourceRunID)); err != nil {
+			return fmt.Errorf("%w: invalid source run ID", ErrInvalidRecord)
+		}
 	}
 	if !validToken(s.ScenarioID, 96) {
 		return fmt.Errorf("%w: invalid scenario ID", ErrInvalidRecord)
