@@ -69,6 +69,24 @@ type Scenario[S any] interface {
 	Reduce(state S, actor ActorSpec, tick uint64, intent Intent) (ScenarioTransition[S], error)
 }
 
+// TickFinalizer lets scenarios evaluate tick-level conditions such as stalls
+// after every scheduled actor has acted but before completion is checked.
+type TickFinalizer[S any] interface {
+	AfterTick(state S, tick uint64, decisions []DecisionRecord) (ScenarioTransition[S], error)
+}
+
+// TopologyProvider exposes an intrinsic message-sharing mode for scenarios
+// whose visibility rules are topology-dependent.
+type TopologyProvider interface {
+	Topology() Topology
+}
+
+// CapabilityProvider reports the capabilities visible to an actor at a tick.
+// The reducer must still enforce revocations when applying an action.
+type CapabilityProvider[S any] interface {
+	AvailableCapabilities(state S, actor ActorSpec, tick uint64) []Capability
+}
+
 type Engine[S any] struct {
 	Store    *RunStore
 	Bundle   BehaviorBundle
@@ -105,6 +123,9 @@ func (e *Engine[S]) validateSpec(spec RunSpec, requirePolicies bool) error {
 	}
 	if e.Scenario.ID() != spec.ScenarioID {
 		return fmt.Errorf("%w: scenario %q is not loaded", ErrInvalidRecord, spec.ScenarioID)
+	}
+	if provider, ok := e.Scenario.(TopologyProvider); ok && provider.Topology() != spec.Topology {
+		return fmt.Errorf("%w: scenario topology does not match run spec", ErrInvalidRecord)
 	}
 	want, err := e.Bundle.Digest()
 	if err != nil {
@@ -175,6 +196,10 @@ func (e *Engine[S]) run(ctx context.Context, spec RunSpec, recorded []DecisionRe
 			if !e.Scenario.Eligible(state, actor, tick) {
 				continue
 			}
+			capabilities := actor.Capabilities
+			if provider, ok := e.Scenario.(CapabilityProvider[S]); ok {
+				capabilities = provider.AvailableCapabilities(state, actor, tick)
+			}
 			data, err := e.Scenario.Observe(state, actor, tick)
 			if err != nil {
 				return failIncomplete(fmt.Errorf("observe actor %s at tick %d: %w", actor.ID, tick, err))
@@ -192,20 +217,23 @@ func (e *Engine[S]) run(ctx context.Context, spec RunSpec, recorded []DecisionRe
 					ScenarioID:            spec.ScenarioID,
 					Tick:                  tick,
 					ActorID:               actor.ID,
-					Capabilities:          append([]Capability(nil), actor.Capabilities...),
+					Capabilities:          append([]Capability(nil), capabilities...),
 					RemainingActionBudget: remaining,
 					Data:                  bytes.Clone(data),
 				},
 			})
 		}
 
+		tickDecisions := make([]DecisionRecord, 0, len(scheduled))
 		for _, scheduledActor := range scheduled {
 			if err := ctx.Err(); err != nil {
 				return failIncomplete(err)
 			}
 			actor := scheduledActor.actor
 			suppression := ""
-			if actorActions[actor.ID] >= actor.ActionBudget {
+			if e.Scenario.Complete(state) {
+				suppression = "scenario_completed"
+			} else if actorActions[actor.ID] >= actor.ActionBudget {
 				suppression = "actor_action_budget_exhausted"
 			} else if totalActions >= spec.Limits.MaxTotalActions {
 				suppression = "run_action_budget_exhausted"
@@ -249,6 +277,7 @@ func (e *Engine[S]) run(ctx context.Context, spec RunSpec, recorded []DecisionRe
 			if err := writer.AppendPublic(decisionEvent(decision)); err != nil {
 				return failIncomplete(err)
 			}
+			tickDecisions = append(tickDecisions, decision)
 
 			if decision.Kind != DecisionIntent {
 				continue
@@ -277,6 +306,16 @@ func (e *Engine[S]) run(ctx context.Context, spec RunSpec, recorded []DecisionRe
 				continue
 			}
 			if err := appendTransition(writer, transition, actor, tick); err != nil {
+				return failIncomplete(err)
+			}
+			state = transition.NextState
+		}
+		if finalizer, ok := e.Scenario.(TickFinalizer[S]); ok {
+			transition, err := finalizer.AfterTick(state, tick, tickDecisions)
+			if err != nil {
+				return failIncomplete(fmt.Errorf("finalize scenario tick %d: %w", tick, err))
+			}
+			if err := appendTransition(writer, transition, ActorSpec{}, tick); err != nil {
 				return failIncomplete(err)
 			}
 			state = transition.NextState
@@ -328,7 +367,12 @@ func (e *Engine[S]) decide(ctx context.Context, actor ActorSpec, observation Age
 		}
 		return DecisionRecord{Tick: tick, ActorID: actor.ID, PolicyID: actor.Policy.ID, Kind: DecisionPolicyFault, FaultCode: code}
 	}
-	decision := DecisionRecord{Tick: tick, ActorID: actor.ID, PolicyID: actor.Policy.ID, Kind: proposal.Kind, Intent: proposal.Intent}
+	var intent *Intent
+	if proposal.Intent != nil {
+		intentCopy := *proposal.Intent
+		intent = &intentCopy
+	}
+	decision := DecisionRecord{Tick: tick, ActorID: actor.ID, PolicyID: actor.Policy.ID, Kind: proposal.Kind, Intent: intent}
 	if decision.Kind != DecisionIntent && decision.Kind != DecisionNoAction {
 		return DecisionRecord{Tick: tick, ActorID: actor.ID, PolicyID: actor.Policy.ID, Kind: DecisionPolicyFault, FaultCode: "invalid_policy_response"}
 	}
@@ -418,6 +462,7 @@ func scenarioFaultCode(err error) string {
 }
 
 func appendTransition[S any](writer *RunWriter, transition ScenarioTransition[S], actor ActorSpec, tick uint64) error {
+	// Tick-level transitions use an empty actor and may report any scheduled actor.
 	for _, event := range transition.PublicEvents {
 		if event.Tick == 0 {
 			event.Tick = tick
@@ -425,10 +470,10 @@ func appendTransition[S any](writer *RunWriter, transition ScenarioTransition[S]
 		if event.Tick != tick {
 			return fmt.Errorf("scenario event tick %d does not match current tick %d", event.Tick, tick)
 		}
-		if event.ActorID == "" {
+		if event.ActorID == "" && actor.ID != "" {
 			event.ActorID = actor.ID
 		}
-		if event.ActorID != actor.ID {
+		if actor.ID != "" && event.ActorID != actor.ID {
 			return fmt.Errorf("scenario event actor %q does not match actor %q", event.ActorID, actor.ID)
 		}
 		if err := writer.AppendPublic(event); err != nil {
