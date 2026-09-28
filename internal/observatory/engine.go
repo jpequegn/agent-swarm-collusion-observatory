@@ -87,11 +87,16 @@ type CapabilityProvider[S any] interface {
 	AvailableCapabilities(state S, actor ActorSpec, tick uint64) []Capability
 }
 
+type ContainmentApplier[S any] interface {
+	ApplyContainment(state S, action ContainmentAction, tick uint64) (ScenarioTransition[S], error)
+}
+
 type Engine[S any] struct {
 	Store    *RunStore
 	Bundle   BehaviorBundle
 	Scenario Scenario[S]
 	Policies map[PolicyID]DecisionPolicy
+	Monitor  Monitor
 }
 
 type RunResult struct {
@@ -135,6 +140,9 @@ func (e *Engine[S]) validateSpec(spec RunSpec, requirePolicies bool) error {
 	if err != nil || got != want {
 		return ErrUnsupportedBehaviorBundle
 	}
+	if (e.Monitor == nil && spec.BehaviorBundle.MonitorVersion != disabledMonitorVersion) || (e.Monitor != nil && e.Monitor.Version() != spec.BehaviorBundle.MonitorVersion) {
+		return ErrUnsupportedBehaviorBundle
+	}
 	if requirePolicies {
 		if spec.SourceRunID != "" {
 			return fmt.Errorf("%w: ordinary runs cannot carry replay provenance", ErrInvalidRecord)
@@ -160,6 +168,10 @@ func (e *Engine[S]) run(ctx context.Context, spec RunSpec, recorded []DecisionRe
 	if err := e.validateSpec(spec, !replay); err != nil {
 		return RunResult{}, err
 	}
+	monitor, err := newMonitorRuntime(e.Monitor, spec)
+	if err != nil {
+		return RunResult{}, err
+	}
 	writer, err := e.Store.Reserve(spec)
 	if err != nil {
 		return RunResult{}, err
@@ -172,11 +184,18 @@ func (e *Engine[S]) run(ctx context.Context, spec RunSpec, recorded []DecisionRe
 		}
 		return result, cause
 	}
+	appendPublic := func(event PublicEvent) error {
+		if err := writer.AppendPublic(event); err != nil {
+			return err
+		}
+		return monitor.observePublic(writer, spec, event)
+	}
 
 	actors := append([]ActorSpec(nil), spec.Actors...)
 	sort.Slice(actors, func(i, j int) bool { return actors[i].ID < actors[j].ID })
 	state := e.Scenario.InitialState(spec.Seed)
 	actorActions := make(map[ActorID]uint64, len(actors))
+	pausedActors := make(map[ActorID]bool)
 	var totalActions uint64
 	decisionIndex := 0
 	var decisionCount uint64
@@ -184,6 +203,48 @@ func (e *Engine[S]) run(ctx context.Context, spec RunSpec, recorded []DecisionRe
 	for tick := uint64(1); ; tick++ {
 		if err := ctx.Err(); err != nil {
 			return failIncomplete(err)
+		}
+		for _, scheduled := range monitor.takePending(tick) {
+			action := *scheduled.record.Action
+			switch action.Kind {
+			case ContainmentPauseActor:
+				pausedActors[action.ActorID] = true
+				if err := monitor.recordApplied(writer, scheduled, tick); err != nil {
+					return failIncomplete(err)
+				}
+				if err := appendPublic(PublicEvent{
+					Tick: tick, ActorID: action.ActorID, Kind: "actor_paused",
+					Outcome: "applied", ReasonCode: "monitor_containment",
+				}); err != nil {
+					return failIncomplete(err)
+				}
+			case ContainmentRequestReview:
+				if err := monitor.recordApplied(writer, scheduled, tick); err != nil {
+					return failIncomplete(err)
+				}
+				if err := appendPublic(PublicEvent{
+					Tick: tick, ActorID: action.ActorID, ArtifactID: action.ArtifactID,
+					Kind: "human_review_requested", Outcome: "requested", ReasonCode: "monitor_containment",
+				}); err != nil {
+					return failIncomplete(err)
+				}
+			default:
+				applier, ok := e.Scenario.(ContainmentApplier[S])
+				if !ok {
+					return failIncomplete(errors.New("scenario does not support requested containment action"))
+				}
+				transition, err := applier.ApplyContainment(state, action, tick)
+				if err != nil {
+					return failIncomplete(fmt.Errorf("apply monitor containment: %w", err))
+				}
+				if err := monitor.recordApplied(writer, scheduled, tick); err != nil {
+					return failIncomplete(err)
+				}
+				if err := appendTransition(writer, transition, ActorSpec{}, tick, appendPublic); err != nil {
+					return failIncomplete(err)
+				}
+				state = transition.NextState
+			}
 		}
 		if e.Scenario.Complete(state) {
 			break
@@ -233,6 +294,8 @@ func (e *Engine[S]) run(ctx context.Context, spec RunSpec, recorded []DecisionRe
 			suppression := ""
 			if e.Scenario.Complete(state) {
 				suppression = "scenario_completed"
+			} else if pausedActors[actor.ID] {
+				suppression = "monitor_paused"
 			} else if actorActions[actor.ID] >= actor.ActionBudget {
 				suppression = "actor_action_budget_exhausted"
 			} else if totalActions >= spec.Limits.MaxTotalActions {
@@ -274,7 +337,7 @@ func (e *Engine[S]) run(ctx context.Context, spec RunSpec, recorded []DecisionRe
 				return failIncomplete(err)
 			}
 			decisionCount++
-			if err := writer.AppendPublic(decisionEvent(decision)); err != nil {
+			if err := appendPublic(decisionEvent(decision)); err != nil {
 				return failIncomplete(err)
 			}
 			tickDecisions = append(tickDecisions, decision)
@@ -286,7 +349,7 @@ func (e *Engine[S]) run(ctx context.Context, spec RunSpec, recorded []DecisionRe
 			totalActions++
 			capability := requiredCapability(decision.Intent.Kind)
 			if capability != "" && !hasCapability(actor.Capabilities, capability) {
-				if err := writer.AppendPublic(PublicEvent{
+				if err := appendPublic(PublicEvent{
 					Tick: tick, ActorID: actor.ID, Kind: "intent_rejected", IntentKind: decision.Intent.Kind,
 					Outcome: "rejected", Path: decision.Intent.Path, ReasonCode: "capability_denied",
 				}); err != nil {
@@ -297,7 +360,7 @@ func (e *Engine[S]) run(ctx context.Context, spec RunSpec, recorded []DecisionRe
 			transition, reduceErr := e.Scenario.Reduce(state, actor, tick, *decision.Intent)
 			if reduceErr != nil {
 				code := reducerFaultCode(reduceErr)
-				if err := writer.AppendPublic(PublicEvent{
+				if err := appendPublic(PublicEvent{
 					Tick: tick, ActorID: actor.ID, Kind: "intent_rejected", IntentKind: decision.Intent.Kind,
 					Outcome: "rejected", Path: decision.Intent.Path, ReasonCode: code,
 				}); err != nil {
@@ -305,7 +368,7 @@ func (e *Engine[S]) run(ctx context.Context, spec RunSpec, recorded []DecisionRe
 				}
 				continue
 			}
-			if err := appendTransition(writer, transition, actor, tick); err != nil {
+			if err := appendTransition(writer, transition, actor, tick, appendPublic); err != nil {
 				return failIncomplete(err)
 			}
 			state = transition.NextState
@@ -315,15 +378,21 @@ func (e *Engine[S]) run(ctx context.Context, spec RunSpec, recorded []DecisionRe
 			if err != nil {
 				return failIncomplete(fmt.Errorf("finalize scenario tick %d: %w", tick, err))
 			}
-			if err := appendTransition(writer, transition, ActorSpec{}, tick); err != nil {
+			if err := appendTransition(writer, transition, ActorSpec{}, tick, appendPublic); err != nil {
 				return failIncomplete(err)
 			}
 			state = transition.NextState
 		}
 		if e.Scenario.Complete(state) {
+			if err := monitor.finishTick(writer, tick, "scenario_completed"); err != nil {
+				return failIncomplete(err)
+			}
 			break
 		}
 		if tick == spec.Limits.MaxTicks {
+			if err := monitor.finishTick(writer, tick, "run_tick_limit"); err != nil {
+				return failIncomplete(err)
+			}
 			break
 		}
 	}
@@ -461,7 +530,7 @@ func scenarioFaultCode(err error) string {
 	return ""
 }
 
-func appendTransition[S any](writer *RunWriter, transition ScenarioTransition[S], actor ActorSpec, tick uint64) error {
+func appendTransition[S any](writer *RunWriter, transition ScenarioTransition[S], actor ActorSpec, tick uint64, appendPublic func(PublicEvent) error) error {
 	// Tick-level transitions use an empty actor and may report any scheduled actor.
 	for _, event := range transition.PublicEvents {
 		if event.Tick == 0 {
@@ -476,7 +545,7 @@ func appendTransition[S any](writer *RunWriter, transition ScenarioTransition[S]
 		if actor.ID != "" && event.ActorID != actor.ID {
 			return fmt.Errorf("scenario event actor %q does not match actor %q", event.ActorID, actor.ID)
 		}
-		if err := writer.AppendPublic(event); err != nil {
+		if err := appendPublic(event); err != nil {
 			return err
 		}
 	}

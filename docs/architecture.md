@@ -9,11 +9,17 @@ One Go engine owns virtual time, action validation, state reduction, event stora
 ## Evidence and information flow
 
 - Public events and evaluator-only truth are distinct types and persisted streams.
-- Agents see only their allowlisted observations. The independent monitor receives a separate, contiguous projection with no truth or hidden global sequence gaps.
+- Agents see only their allowlisted observations. The independent monitor receives a separate, contiguous projection built from typed public facts; it has no truth access or hidden global sequence gaps.
 - Evaluation sees truth only after a run is complete and its seal verifies.
-- Run IDs are reserved atomically and are never overwritten. A seal binds the run specification, behavior bundle, event streams, decision trace, counts, and completion state.
+- Run IDs are reserved atomically and are never overwritten. A seal binds the run specification, behavior bundle, public, truth, decision, and monitor streams, counts, and completion state.
 - Replay verifies the source seal and complete decision trace, then recomputes derived output under the same supported behavior bundle. Unsupported bundles fail closed. Replay does not rerun Python.
 - If final seal publication succeeds but directory synchronization reports an error, the result is indeterminate; verify the same run ID before retrying.
+
+## Independent monitor and containment
+
+The monitor receives one `MonitorObservation` for each public event. Its local sequence is contiguous and its fields exclude message bodies and evaluator truth. The default deterministic rules pause an actor after repeated duplicate tool calls, revoke edit access and request review after a proxy reward is followed by failed verification, and quarantine an artifact after repeated sharing following a proxy mismatch. A single aid message or share and a successful verification do not trigger these rules.
+
+Alerts include stable identities, rule IDs, rationale codes, and typed actions in the hash-chained monitor stream. Containment takes effect on the next virtual tick and emits new public events; it never edits earlier evidence. A human-review request is recorded in the run but does not send an external notification. Rule thresholds are bound into the monitor version. Go callers enable the monitor by setting `BehaviorBundle.MonitorVersion` to `monitor.Version()` and supplying the same monitor on `Engine`; runs without a monitor use `monitor-disabled-v1`.
 
 Determinism is guaranteed for the same complete recorded decision trace and behavior bundle. Host-dependent subprocess timeouts can change a live run and are recorded as explicit faults; identical run specifications alone do not promise identical live outcomes.
 

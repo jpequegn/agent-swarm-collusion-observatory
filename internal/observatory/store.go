@@ -35,11 +35,12 @@ type RunStore struct {
 }
 
 type VerifiedRun struct {
-	Spec         RunSpec
-	Seal         RunSeal
-	PublicEvents []PublicEvent
-	TruthRecords []TruthRecord
-	Decisions    []DecisionRecord
+	Spec           RunSpec
+	Seal           RunSeal
+	PublicEvents   []PublicEvent
+	TruthRecords   []TruthRecord
+	Decisions      []DecisionRecord
+	MonitorRecords []MonitorRecord
 }
 
 type streamWriter struct {
@@ -58,6 +59,7 @@ type RunWriter struct {
 	public       streamWriter
 	truth        streamWriter
 	decisions    streamWriter
+	monitor      streamWriter
 	closed       bool
 	failed       error
 }
@@ -136,6 +138,7 @@ func (s *RunStore) Reserve(spec RunSpec) (*RunWriter, error) {
 		{name: "public.jsonl"},
 		{name: "truth.jsonl"},
 		{name: "decisions.jsonl"},
+		{name: "monitor.jsonl"},
 	}
 	for _, stream := range streams {
 		file, openErr := os.OpenFile(filepath.Join(dir, stream.name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
@@ -151,6 +154,8 @@ func (s *RunStore) Reserve(spec RunSpec) (*RunWriter, error) {
 			w.truth = *stream
 		case "decisions.jsonl":
 			w.decisions = *stream
+		case "monitor.jsonl":
+			w.monitor = *stream
 		}
 	}
 	return w, nil
@@ -184,6 +189,16 @@ func (w *RunWriter) AppendDecision(record DecisionRecord) error {
 		return err
 	}
 	return w.append(&w.decisions, record)
+}
+
+func (w *RunWriter) AppendMonitor(record MonitorRecord) error {
+	if w == nil {
+		return errors.New("run writer is nil")
+	}
+	if err := record.Validate(); err != nil {
+		return err
+	}
+	return w.append(&w.monitor, record)
 }
 
 func (w *RunWriter) append(stream *streamWriter, value any) error {
@@ -229,7 +244,7 @@ func (w *RunWriter) append(stream *streamWriter, value any) error {
 	return nil
 }
 
-// Finalize writes a seal only after all three streams have been synced. If the
+// Finalize writes a seal only after all four streams have been synced. If the
 // seal is published but directory sync fails, callers must Verify the same run
 // ID before deciding whether to retry. The engine must establish full schedule
 // coverage before passing completed=true. A finalized incomplete run carries
@@ -254,7 +269,7 @@ func (w *RunWriter) Finalize(completed bool) (RunSeal, error) {
 		return RunSeal{}, fmt.Errorf("%w: completed runs require a decision trace", ErrIncompleteRun)
 	}
 	var syncErr error
-	for _, stream := range []*streamWriter{&w.public, &w.truth, &w.decisions} {
+	for _, stream := range []*streamWriter{&w.public, &w.truth, &w.decisions, &w.monitor} {
 		if err := stream.file.Sync(); err != nil && syncErr == nil {
 			syncErr = err
 		}
@@ -276,6 +291,8 @@ func (w *RunWriter) Finalize(completed bool) (RunSeal, error) {
 		TruthCount:           w.truth.count,
 		DecisionHead:         w.decisions.head,
 		DecisionCount:        w.decisions.count,
+		MonitorHead:          w.monitor.head,
+		MonitorCount:         w.monitor.count,
 		Completed:            completed,
 	}
 	encoded, err := json.Marshal(seal)
@@ -293,7 +310,7 @@ func (w *RunWriter) Finalize(completed bool) (RunSeal, error) {
 
 func (w *RunWriter) closeStreams() error {
 	var closeErr error
-	for _, stream := range []*streamWriter{&w.public, &w.truth, &w.decisions} {
+	for _, stream := range []*streamWriter{&w.public, &w.truth, &w.decisions, &w.monitor} {
 		if stream.file != nil {
 			if err := stream.file.Close(); err != nil && closeErr == nil {
 				closeErr = err
@@ -355,8 +372,10 @@ func (s *RunStore) verify(id RunID, collect bool) (VerifiedRun, error) {
 	}
 
 	actorPolicies := make(map[ActorID]PolicyID, len(spec.Actors))
+	actorSpecs := make(map[ActorID]ActorSpec, len(spec.Actors))
 	for _, actor := range spec.Actors {
 		actorPolicies[actor.ID] = actor.Policy.ID
+		actorSpecs[actor.ID] = actor
 	}
 	publicHead, publicCount, publicEvents, err := verifyStream[PublicEvent](filepath.Join(dir, "public.jsonl"), func(event PublicEvent) error {
 		if err := event.Validate(); err != nil {
@@ -404,8 +423,84 @@ func (s *RunStore) verify(id RunID, collect bool) (VerifiedRun, error) {
 	if err != nil {
 		return VerifiedRun{}, err
 	}
-	verified := VerifiedRun{Spec: spec, Seal: seal, PublicEvents: publicEvents, TruthRecords: truthRecords, Decisions: decisions}
-	if publicHead != seal.PublicHead || publicCount != seal.PublicCount || truthHead != seal.TruthHead || truthCount != seal.TruthCount || decisionHead != seal.DecisionHead || decisionCount != seal.DecisionCount {
+	var monitorObservationSequence uint64
+	var monitorObservationTick uint64
+	var monitorRecordTick uint64
+	monitorObservations := make(map[uint64]MonitorObservation)
+	monitorAlertIDs := make(map[string]struct{})
+	type scheduledAlert struct {
+		record MonitorRecord
+		closed bool
+	}
+	scheduledAlerts := make(map[string]scheduledAlert)
+	monitorHead, monitorCount, monitorRecords, err := verifyStream[MonitorRecord](filepath.Join(dir, "monitor.jsonl"), func(record MonitorRecord) error {
+		if err := record.Validate(); err != nil {
+			return err
+		}
+		if record.Tick > spec.Limits.MaxTicks {
+			return fmt.Errorf("%w: monitor record exceeds run tick limit", ErrInvalidRecord)
+		}
+		if record.Tick < monitorRecordTick {
+			return fmt.Errorf("%w: monitor record ticks move backwards", ErrInvalidRecord)
+		}
+		monitorRecordTick = record.Tick
+		switch record.Kind {
+		case MonitorRecordObservation:
+			monitorObservationSequence++
+			if record.Observation.Sequence != monitorObservationSequence || record.Observation.Tick < monitorObservationTick {
+				return fmt.Errorf("%w: monitor observation sequence is not contiguous", ErrInvalidRecord)
+			}
+			monitorObservationTick = record.Observation.Tick
+			monitorObservations[monitorObservationSequence] = *record.Observation
+		case MonitorRecordAlert:
+			observation, ok := monitorObservations[record.SourceSequence]
+			if !ok || observation.Tick != record.Tick {
+				return fmt.Errorf("%w: monitor alert does not cite a same-tick observation", ErrInvalidRecord)
+			}
+			if _, exists := monitorAlertIDs[record.AlertID]; exists {
+				return fmt.Errorf("%w: duplicate monitor alert identity", ErrInvalidRecord)
+			}
+			monitorAlertIDs[record.AlertID] = struct{}{}
+			action := *record.Action
+			if action.ActorID != "" {
+				actor, exists := actorSpecs[action.ActorID]
+				if !exists || action.Kind == ContainmentRevokeCapability && !hasCapability(actor.Capabilities, action.Capability) {
+					return fmt.Errorf("%w: monitor action target does not match run spec", ErrInvalidRecord)
+				}
+			}
+			alert := MonitorAlert{
+				SourceSequence: record.SourceSequence, RuleID: record.RuleID,
+				RationaleCode: record.RationaleCode, Action: action,
+			}
+			if monitorAlertID(spec.ScenarioID, alert) != record.AlertID {
+				return fmt.Errorf("%w: monitor alert identity does not match its evidence", ErrInvalidRecord)
+			}
+			if record.Outcome == "scheduled" {
+				scheduledAlerts[record.AlertID] = scheduledAlert{record: record}
+			}
+		case MonitorRecordApplied, MonitorRecordSkipped:
+			alert, ok := scheduledAlerts[record.AlertID]
+			if !ok || alert.closed || alert.record.RuleID != record.RuleID || alert.record.RationaleCode != record.RationaleCode || alert.record.SourceSequence != record.SourceSequence || alert.record.EffectiveTick != record.EffectiveTick || *alert.record.Action != *record.Action {
+				return fmt.Errorf("%w: containment does not match its scheduled monitor alert", ErrInvalidRecord)
+			}
+			if record.Kind == MonitorRecordApplied && record.Tick != alert.record.EffectiveTick || record.Kind == MonitorRecordSkipped && record.Tick != alert.record.Tick {
+				return fmt.Errorf("%w: containment was recorded at the wrong tick", ErrInvalidRecord)
+			}
+			alert.closed = true
+			scheduledAlerts[record.AlertID] = alert
+		}
+		return nil
+	}, collect)
+	if err != nil {
+		return VerifiedRun{}, err
+	}
+	for _, alert := range scheduledAlerts {
+		if !alert.closed {
+			return VerifiedRun{}, fmt.Errorf("%w: scheduled monitor alert has no containment outcome", ErrIntegrity)
+		}
+	}
+	verified := VerifiedRun{Spec: spec, Seal: seal, PublicEvents: publicEvents, TruthRecords: truthRecords, Decisions: decisions, MonitorRecords: monitorRecords}
+	if publicHead != seal.PublicHead || publicCount != seal.PublicCount || truthHead != seal.TruthHead || truthCount != seal.TruthCount || decisionHead != seal.DecisionHead || decisionCount != seal.DecisionCount || monitorHead != seal.MonitorHead || monitorCount != seal.MonitorCount {
 		return VerifiedRun{}, fmt.Errorf("%w: stream head or count mismatch", ErrIntegrity)
 	}
 	if seal.Completed && decisionCount == 0 {
@@ -522,7 +617,7 @@ func (o MonitorObservation) Validate() error {
 	if !utf8.ValidString(o.Resource) || !utf8.ValidString(o.ReasonCode) {
 		return fmt.Errorf("%w: monitor observation contains invalid UTF-8", ErrInvalidRecord)
 	}
-	if o.Sequence == 0 || !validToken(o.EventKind, 96) || !validToken(o.Outcome, 96) {
+	if o.Sequence == 0 || o.Tick == 0 || len(o.Resource) > 256 || !validToken(o.EventKind, 96) || !validToken(o.Outcome, 96) {
 		return fmt.Errorf("%w: invalid monitor observation", ErrInvalidRecord)
 	}
 	if o.ActorID != "" && !validToken(string(o.ActorID), 96) {
@@ -536,6 +631,66 @@ func (o MonitorObservation) Validate() error {
 	}
 	if o.ContentDigest != "" && !isDigest(o.ContentDigest) {
 		return fmt.Errorf("%w: invalid monitor content digest", ErrInvalidRecord)
+	}
+	return nil
+}
+
+func (a ContainmentAction) Validate() error {
+	if a.ActorID != "" && !validToken(string(a.ActorID), 96) || a.Capability != "" && !validToken(string(a.Capability), 96) || a.ArtifactID != "" && !validToken(a.ArtifactID, 96) {
+		return fmt.Errorf("%w: invalid containment target", ErrInvalidRecord)
+	}
+	valid := false
+	switch a.Kind {
+	case ContainmentPauseActor:
+		valid = a.ActorID != "" && a.Capability == "" && a.ArtifactID == ""
+	case ContainmentRevokeCapability:
+		valid = a.ActorID != "" && a.Capability != "" && a.ArtifactID == ""
+	case ContainmentQuarantineArtifact:
+		valid = a.ActorID == "" && a.Capability == "" && a.ArtifactID != ""
+	case ContainmentRequestReview:
+		valid = a.Capability == "" && (a.ActorID != "" || a.ArtifactID != "")
+	}
+	if !valid {
+		return fmt.Errorf("%w: invalid containment action", ErrInvalidRecord)
+	}
+	return nil
+}
+
+func (r MonitorRecord) Validate() error {
+	if r.Tick == 0 {
+		return fmt.Errorf("%w: monitor record requires a positive tick", ErrInvalidRecord)
+	}
+	switch r.Kind {
+	case MonitorRecordObservation:
+		if r.Observation == nil || r.AlertID != "" || r.RuleID != "" || r.RationaleCode != "" || r.SourceSequence != 0 || r.EffectiveTick != 0 || r.Action != nil || r.Outcome != "" {
+			return fmt.Errorf("%w: invalid monitor observation record", ErrInvalidRecord)
+		}
+		if err := r.Observation.Validate(); err != nil || r.Observation.Tick != r.Tick {
+			return fmt.Errorf("%w: monitor observation does not match its record", ErrInvalidRecord)
+		}
+	case MonitorRecordAlert, MonitorRecordApplied, MonitorRecordSkipped:
+		if r.Observation != nil || !validToken(r.AlertID, 96) || !validToken(r.RuleID, 96) || !validToken(r.RationaleCode, 96) || r.SourceSequence == 0 || r.Action == nil {
+			return fmt.Errorf("%w: invalid monitor alert or containment record", ErrInvalidRecord)
+		}
+		if err := r.Action.Validate(); err != nil {
+			return err
+		}
+		switch r.Kind {
+		case MonitorRecordAlert:
+			if r.Tick == ^uint64(0) || r.EffectiveTick != r.Tick+1 || r.Outcome != "scheduled" && r.Outcome != "duplicate_suppressed" {
+				return fmt.Errorf("%w: invalid monitor alert schedule", ErrInvalidRecord)
+			}
+		case MonitorRecordApplied:
+			if r.EffectiveTick != r.Tick || r.Outcome != "applied" {
+				return fmt.Errorf("%w: invalid applied containment record", ErrInvalidRecord)
+			}
+		case MonitorRecordSkipped:
+			if r.Tick == ^uint64(0) || r.EffectiveTick != r.Tick+1 || r.Outcome != "scenario_completed" && r.Outcome != "run_tick_limit" {
+				return fmt.Errorf("%w: invalid skipped containment record", ErrInvalidRecord)
+			}
+		}
+	default:
+		return fmt.Errorf("%w: unsupported monitor record kind", ErrInvalidRecord)
 	}
 	return nil
 }

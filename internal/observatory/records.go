@@ -291,6 +291,51 @@ type MonitorObservation struct {
 	ReasonCode    string     `json:"reason_code,omitempty"`
 }
 
+type ContainmentKind string
+
+const (
+	ContainmentPauseActor         ContainmentKind = "pause_actor"
+	ContainmentRevokeCapability   ContainmentKind = "revoke_capability"
+	ContainmentQuarantineArtifact ContainmentKind = "quarantine_artifact"
+	ContainmentRequestReview      ContainmentKind = "request_human_review"
+)
+
+type ContainmentAction struct {
+	Kind       ContainmentKind `json:"kind"`
+	ActorID    ActorID         `json:"actor_id,omitempty"`
+	Capability Capability      `json:"capability,omitempty"`
+	ArtifactID string          `json:"artifact_id,omitempty"`
+}
+
+type MonitorAlert struct {
+	SourceSequence uint64            `json:"source_sequence"`
+	RuleID         string            `json:"rule_id"`
+	RationaleCode  string            `json:"rationale_code"`
+	Action         ContainmentAction `json:"action"`
+}
+
+type MonitorRecordKind string
+
+const (
+	MonitorRecordObservation MonitorRecordKind = "observation"
+	MonitorRecordAlert       MonitorRecordKind = "alert"
+	MonitorRecordApplied     MonitorRecordKind = "containment_applied"
+	MonitorRecordSkipped     MonitorRecordKind = "containment_skipped"
+)
+
+type MonitorRecord struct {
+	Kind           MonitorRecordKind   `json:"kind"`
+	Tick           uint64              `json:"tick"`
+	Observation    *MonitorObservation `json:"observation,omitempty"`
+	AlertID        string              `json:"alert_id,omitempty"`
+	RuleID         string              `json:"rule_id,omitempty"`
+	RationaleCode  string              `json:"rationale_code,omitempty"`
+	SourceSequence uint64              `json:"source_sequence,omitempty"`
+	EffectiveTick  uint64              `json:"effective_tick,omitempty"`
+	Action         *ContainmentAction  `json:"action,omitempty"`
+	Outcome        string              `json:"outcome,omitempty"`
+}
+
 type RunSeal struct {
 	SpecDigest           string `json:"spec_digest"`
 	BehaviorBundleDigest string `json:"behavior_bundle_digest"`
@@ -300,6 +345,8 @@ type RunSeal struct {
 	TruthCount           uint64 `json:"truth_count"`
 	DecisionHead         string `json:"decision_head"`
 	DecisionCount        uint64 `json:"decision_count"`
+	MonitorHead          string `json:"monitor_head"`
+	MonitorCount         uint64 `json:"monitor_count"`
 	Completed            bool   `json:"completed"`
 }
 

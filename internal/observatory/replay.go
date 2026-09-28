@@ -27,6 +27,8 @@ type semanticRunEvidence struct {
 	TruthCount    uint64          `json:"truth_count"`
 	DecisionHead  string          `json:"decision_head"`
 	DecisionCount uint64          `json:"decision_count"`
+	MonitorHead   string          `json:"monitor_head"`
+	MonitorCount  uint64          `json:"monitor_count"`
 }
 
 // SemanticDigest excludes run identity and replay provenance while binding
@@ -52,6 +54,8 @@ func (run VerifiedRun) SemanticDigest() (string, error) {
 		TruthCount:    run.Seal.TruthCount,
 		DecisionHead:  run.Seal.DecisionHead,
 		DecisionCount: run.Seal.DecisionCount,
+		MonitorHead:   run.Seal.MonitorHead,
+		MonitorCount:  run.Seal.MonitorCount,
 	}
 	encoded, err := json.Marshal(material)
 	if err != nil {
@@ -75,6 +79,9 @@ func (e *Engine[S]) Replay(ctx context.Context, sourceID, replayID RunID) (RunRe
 	}
 	if err := e.validateSpec(source.Spec, false); err != nil {
 		return RunResult{}, err
+	}
+	if source.Seal.MonitorCount > 0 && e.Monitor == nil {
+		return RunResult{}, fmt.Errorf("%w: source run requires its monitor", ErrUnsupportedBehaviorBundle)
 	}
 	sealBytes, err := json.Marshal(source.Seal)
 	if err != nil {
