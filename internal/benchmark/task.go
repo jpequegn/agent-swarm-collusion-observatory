@@ -280,18 +280,20 @@ func (s *PackageRepairScenario) ID() string { return s.task.ID }
 
 func (s *PackageRepairScenario) Topology() observatory.Topology { return s.topology }
 
-func (s *PackageRepairScenario) AvailableCapabilities(_ WorldState, actor observatory.ActorSpec, tick uint64) []observatory.Capability {
-	return s.effectiveCapabilities(actor, tick)
+func (s *PackageRepairScenario) AvailableCapabilities(state WorldState, actor observatory.ActorSpec, tick uint64) []observatory.Capability {
+	return s.effectiveCapabilities(state, actor, tick)
 }
 
 func (s *PackageRepairScenario) InitialState(int64) WorldState {
 	return WorldState{
-		Files:           cloneStringMap(s.task.InitialFiles),
-		InspectedFiles:  make(map[observatory.ActorID]map[string]string),
-		SharedArtifacts: make(map[string]bool),
-		SeenCalls:       make(map[string]bool),
-		SpentByActor:    make(map[observatory.ActorID]uint64),
-		Messages:        make([]Message, 0),
+		Files:                cloneStringMap(s.task.InitialFiles),
+		InspectedFiles:       make(map[observatory.ActorID]map[string]string),
+		SharedArtifacts:      make(map[string]bool),
+		QuarantinedArtifacts: make(map[string]bool),
+		ContainmentRevoked:   make(map[observatory.ActorID]map[observatory.Capability]bool),
+		SeenCalls:            make(map[string]bool),
+		SpentByActor:         make(map[observatory.ActorID]uint64),
+		Messages:             make([]Message, 0),
 	}
 }
 
@@ -309,6 +311,48 @@ func (s *PackageRepairScenario) Observe(state WorldState, actor observatory.Acto
 
 func (s *PackageRepairScenario) Reduce(state WorldState, actor observatory.ActorSpec, tick uint64, intent observatory.Intent) (observatory.ScenarioTransition[WorldState], error) {
 	return s.reduce(state, actor, tick, intent)
+}
+
+func (s *PackageRepairScenario) ApplyContainment(state WorldState, action observatory.ContainmentAction, tick uint64) (observatory.ScenarioTransition[WorldState], error) {
+	if err := action.Validate(); err != nil {
+		return observatory.ScenarioTransition[WorldState]{}, err
+	}
+	if tick == 0 {
+		return observatory.ScenarioTransition[WorldState]{}, fmt.Errorf("%w: containment requires a positive tick", observatory.ErrInvalidRecord)
+	}
+	next := cloneWorldState(state)
+	switch action.Kind {
+	case observatory.ContainmentRevokeCapability:
+		actor, exists := s.actors[action.ActorID]
+		if !exists || !actorHasCapability(actor, action.Capability) {
+			return observatory.ScenarioTransition[WorldState]{}, observatory.ScenarioFailure{Code: "containment_target_unavailable"}
+		}
+		if s.isRevoked(action.ActorID, action.Capability, tick) || next.ContainmentRevoked[action.ActorID][action.Capability] {
+			return observatory.ScenarioTransition[WorldState]{}, observatory.ScenarioFailure{Code: "capability_already_revoked"}
+		}
+		if next.ContainmentRevoked[action.ActorID] == nil {
+			next.ContainmentRevoked[action.ActorID] = make(map[observatory.Capability]bool)
+		}
+		next.ContainmentRevoked[action.ActorID][action.Capability] = true
+		return transition(next, observatory.PublicEvent{
+			Tick: tick, ActorID: action.ActorID, Kind: "capability_revoked",
+			Outcome: "applied", ReasonCode: "monitor_containment",
+		}), nil
+	case observatory.ContainmentQuarantineArtifact:
+		if _, exists := s.artifacts[action.ArtifactID]; !exists {
+			return observatory.ScenarioTransition[WorldState]{}, observatory.ScenarioFailure{Code: "containment_target_unavailable"}
+		}
+		if next.QuarantinedArtifacts[action.ArtifactID] {
+			return observatory.ScenarioTransition[WorldState]{}, observatory.ScenarioFailure{Code: "artifact_already_quarantined"}
+		}
+		next.QuarantinedArtifacts[action.ArtifactID] = true
+		return transition(next, observatory.PublicEvent{
+			Tick: tick, ArtifactID: action.ArtifactID, Kind: "artifact_quarantined",
+			Outcome: "applied", ReasonCode: "monitor_containment",
+		}), nil
+	default:
+		return observatory.ScenarioTransition[WorldState]{}, observatory.ScenarioFailure{Code: "unsupported_containment"}
+	}
 }
 
 func cloneRunSpec(spec observatory.RunSpec) observatory.RunSpec {

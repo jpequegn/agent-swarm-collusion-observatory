@@ -51,25 +51,27 @@ type Observation struct {
 }
 
 type WorldState struct {
-	Files              map[string]string                         `json:"files"`
-	InspectedFiles     map[observatory.ActorID]map[string]string `json:"inspected_files"`
-	Messages           []Message                                 `json:"messages"`
-	SharedArtifacts    map[string]bool                           `json:"shared_artifacts"`
-	SeenCalls          map[string]bool                           `json:"seen_calls"`
-	SpentByActor       map[observatory.ActorID]uint64            `json:"spent_by_actor"`
-	TotalSpent         uint64                                    `json:"total_spent"`
-	Attempts           uint64                                    `json:"attempts"`
-	RejectedAttempts   uint64                                    `json:"rejected_attempts"`
-	DuplicateAttempts  uint64                                    `json:"duplicate_attempts"`
-	VerificationCount  uint64                                    `json:"verification_count"`
-	Progress           uint64                                    `json:"progress"`
-	LastProgress       uint64                                    `json:"last_progress"`
-	StalledTicks       uint64                                    `json:"stalled_ticks"`
-	RewardScore        uint64                                    `json:"reward_score"`
-	Verified           bool                                      `json:"verified"`
-	Submitted          bool                                      `json:"submitted"`
-	BailedOut          bool                                      `json:"bailed_out"`
-	CapabilityRequests []CapabilityRequest                       `json:"capability_requests"`
+	Files                map[string]string                                       `json:"files"`
+	InspectedFiles       map[observatory.ActorID]map[string]string               `json:"inspected_files"`
+	Messages             []Message                                               `json:"messages"`
+	SharedArtifacts      map[string]bool                                         `json:"shared_artifacts"`
+	QuarantinedArtifacts map[string]bool                                         `json:"quarantined_artifacts"`
+	ContainmentRevoked   map[observatory.ActorID]map[observatory.Capability]bool `json:"containment_revoked"`
+	SeenCalls            map[string]bool                                         `json:"seen_calls"`
+	SpentByActor         map[observatory.ActorID]uint64                          `json:"spent_by_actor"`
+	TotalSpent           uint64                                                  `json:"total_spent"`
+	Attempts             uint64                                                  `json:"attempts"`
+	RejectedAttempts     uint64                                                  `json:"rejected_attempts"`
+	DuplicateAttempts    uint64                                                  `json:"duplicate_attempts"`
+	VerificationCount    uint64                                                  `json:"verification_count"`
+	Progress             uint64                                                  `json:"progress"`
+	LastProgress         uint64                                                  `json:"last_progress"`
+	StalledTicks         uint64                                                  `json:"stalled_ticks"`
+	RewardScore          uint64                                                  `json:"reward_score"`
+	Verified             bool                                                    `json:"verified"`
+	Submitted            bool                                                    `json:"submitted"`
+	BailedOut            bool                                                    `json:"bailed_out"`
+	CapabilityRequests   []CapabilityRequest                                     `json:"capability_requests"`
 }
 
 type CapabilityRequest struct {
@@ -81,9 +83,9 @@ type CapabilityRequest struct {
 func (s *PackageRepairScenario) observe(state WorldState, actor observatory.ActorSpec, tick uint64) (json.RawMessage, error) {
 	observation := Observation{
 		TaskID: s.task.ID, Tick: tick, Topology: s.topology,
-		ReadableFiles: s.accessiblePaths(actor.ID, "inspect", tick),
-		EditableFiles: s.accessiblePaths(actor.ID, "edit", tick),
-		Capabilities:  s.effectiveCapabilities(actor, tick),
+		ReadableFiles: s.accessiblePaths(state, actor.ID, "inspect", tick),
+		EditableFiles: s.accessiblePaths(state, actor.ID, "edit", tick),
+		Capabilities:  s.effectiveCapabilities(state, actor, tick),
 		Verified:      state.Verified, Submitted: state.Submitted, RewardScore: state.RewardScore,
 		StalledTicks: state.StalledTicks, Spent: state.SpentByActor[actor.ID],
 		SpendBudget: actor.SpendBudget, SpendRemaining: spendRemaining(actor.SpendBudget, state.SpentByActor[actor.ID]),
@@ -99,6 +101,9 @@ func (s *PackageRepairScenario) observe(state WorldState, actor observatory.Acto
 		}
 	}
 	for id, artifact := range s.artifacts {
+		if state.QuarantinedArtifacts[id] {
+			continue
+		}
 		if actor.ID == artifact.Owner || state.SharedArtifacts[id] && s.canSeeActor(actor.ID, artifact.Owner) {
 			observation.Artifacts = append(observation.Artifacts, ArtifactView{ID: id, Owner: string(artifact.Owner), Content: artifact.Content})
 		}
@@ -143,7 +148,7 @@ func (s *PackageRepairScenario) reduce(state WorldState, actor observatory.Actor
 	next.SpentByActor[actor.ID] += cost
 	next.TotalSpent += cost
 
-	if capability := requiredCapability(intent.Kind); capability != "" && s.isRevoked(actor.ID, capability, tick) {
+	if capability := requiredCapability(intent.Kind); capability != "" && (s.isRevoked(actor.ID, capability, tick) || state.ContainmentRevoked[actor.ID][capability]) {
 		next.RejectedAttempts++
 		return transition(next, rejectedEvent(tick, actor.ID, intent, "permission_revoked")), nil
 	}
@@ -253,6 +258,9 @@ func (s *PackageRepairScenario) reduce(state WorldState, actor observatory.Actor
 		}), nil
 
 	case observatory.IntentShareArtifact:
+		if next.QuarantinedArtifacts[intent.ArtifactID] {
+			return reject(next, tick, actor.ID, intent, "artifact_quarantined"), nil
+		}
 		artifact, exists := s.artifacts[intent.ArtifactID]
 		if !exists || actor.ID != artifact.Owner && (!next.SharedArtifacts[intent.ArtifactID] || !s.canSeeActor(actor.ID, artifact.Owner)) {
 			return reject(next, tick, actor.ID, intent, "artifact_not_available"), nil
@@ -414,10 +422,10 @@ func matchesCases(results []bool, cases []VerificationCase) bool {
 	return true
 }
 
-func (s *PackageRepairScenario) effectiveCapabilities(actor observatory.ActorSpec, tick uint64) []observatory.Capability {
+func (s *PackageRepairScenario) effectiveCapabilities(state WorldState, actor observatory.ActorSpec, tick uint64) []observatory.Capability {
 	capabilities := make([]observatory.Capability, 0, len(actor.Capabilities))
 	for _, capability := range actor.Capabilities {
-		if !s.isRevoked(actor.ID, capability, tick) {
+		if !s.isRevoked(actor.ID, capability, tick) && !state.ContainmentRevoked[actor.ID][capability] {
 			capabilities = append(capabilities, capability)
 		}
 	}
@@ -425,8 +433,8 @@ func (s *PackageRepairScenario) effectiveCapabilities(actor observatory.ActorSpe
 	return capabilities
 }
 
-func (s *PackageRepairScenario) accessiblePaths(actor observatory.ActorID, capability observatory.Capability, tick uint64) []string {
-	if !actorHasCapability(s.actors[actor], capability) || s.isRevoked(actor, capability, tick) {
+func (s *PackageRepairScenario) accessiblePaths(state WorldState, actor observatory.ActorID, capability observatory.Capability, tick uint64) []string {
+	if !actorHasCapability(s.actors[actor], capability) || s.isRevoked(actor, capability, tick) || state.ContainmentRevoked[actor][capability] {
 		return []string{}
 	}
 	access := s.readable
@@ -511,6 +519,8 @@ func cloneWorldState(state WorldState) WorldState {
 	}
 	state.Messages = append([]Message(nil), state.Messages...)
 	state.SharedArtifacts = cloneBoolMap(state.SharedArtifacts)
+	state.QuarantinedArtifacts = cloneBoolMap(state.QuarantinedArtifacts)
+	state.ContainmentRevoked = cloneCapabilityMap(state.ContainmentRevoked)
 	state.SeenCalls = cloneBoolMap(state.SeenCalls)
 	spentByActor := state.SpentByActor
 	state.SpentByActor = make(map[observatory.ActorID]uint64, len(spentByActor))
@@ -519,6 +529,18 @@ func cloneWorldState(state WorldState) WorldState {
 	}
 	state.CapabilityRequests = append([]CapabilityRequest(nil), state.CapabilityRequests...)
 	return state
+}
+
+func cloneCapabilityMap(source map[observatory.ActorID]map[observatory.Capability]bool) map[observatory.ActorID]map[observatory.Capability]bool {
+	clone := make(map[observatory.ActorID]map[observatory.Capability]bool, len(source))
+	for actor, capabilities := range source {
+		actorCapabilities := make(map[observatory.Capability]bool, len(capabilities))
+		for capability, revoked := range capabilities {
+			actorCapabilities[capability] = revoked
+		}
+		clone[actor] = actorCapabilities
+	}
+	return clone
 }
 
 func cloneBoolMap(source map[string]bool) map[string]bool {

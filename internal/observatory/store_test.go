@@ -20,7 +20,7 @@ func testRunSpec(id RunID) RunSpec {
 		Seed:       7,
 		BehaviorBundle: BehaviorBundle{
 			EngineVersion:         "engine-v1",
-			MonitorVersion:        "monitor-v1",
+			MonitorVersion:        "monitor-disabled-v1",
 			ContainmentVersion:    "containment-v1",
 			EvaluatorVersion:      "evaluator-v1",
 			PolicyProtocolVersion: "policy-v1",
@@ -74,7 +74,7 @@ func TestRunSpecRejectsDuplicateActorsAndCapabilities(t *testing.T) {
 }
 
 func TestStoreSeparatesPublicAndTruthStreams(t *testing.T) {
-	for _, record := range []any{PublicEvent{}, MonitorObservation{}} {
+	for _, record := range []any{PublicEvent{}, MonitorObservation{}, MonitorRecord{}} {
 		typ := reflect.TypeOf(record)
 		for _, truthField := range []string{"Truth", "ExpectedDigest", "ActualDigest", "GroundTruth"} {
 			if _, ok := typ.FieldByName(truthField); ok {
@@ -141,12 +141,16 @@ func TestStoreSeparatesPublicAndTruthStreams(t *testing.T) {
 	if !bytes.Contains(truthBytes, []byte("ground_truth_sentinel")) {
 		t.Fatalf("truth stream missing sentinel: %s", truthBytes)
 	}
-	monitorBytes, err := json.Marshal(MonitorObservation{Sequence: 1, Tick: 1, EventKind: "artifact_created", Outcome: "accepted"})
+	monitorBytes, err := json.Marshal(projectMonitorEvent(public, 1))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(monitorBytes, []byte("ground_truth_sentinel")) || bytes.Contains(monitorBytes, []byte("expected_digest")) {
-		t.Fatalf("monitor projection contains truth fields: %s", monitorBytes)
+	for _, privateValue := range [][]byte{
+		[]byte("ground_truth_sentinel"), []byte("expected_digest"), []byte("ready for review"),
+	} {
+		if bytes.Contains(monitorBytes, privateValue) {
+			t.Fatalf("monitor projection contains private value %q: %s", privateValue, monitorBytes)
+		}
 	}
 }
 
@@ -329,6 +333,84 @@ func TestTamperedStreamsFailVerification(t *testing.T) {
 				t.Fatalf("Verify error = %v, want ErrIntegrity", err)
 			}
 		})
+	}
+}
+
+func TestTamperedMonitorStreamFailsVerification(t *testing.T) {
+	store, err := NewRunStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := testRunSpec("tampered-monitor")
+	spec.BehaviorBundle.MonitorVersion = monitorVersion
+	writer, err := store.Reserve(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation := MonitorObservation{Sequence: 1, Tick: 1, EventKind: "artifact_created", Outcome: "accepted"}
+	if err := writer.AppendMonitor(MonitorRecord{
+		Kind: MonitorRecordObservation, Tick: 1, Observation: &observation,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	appendNoAction(t, writer, 1)
+	if _, err := writer.Finalize(true); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(store.root, string(spec.RunID), "monitor.jsonl")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := bytes.Replace(data, []byte("artifact_created"), []byte("artifact_changed"), 1)
+	if bytes.Equal(changed, data) {
+		t.Fatal("monitor fixture does not contain the expected event")
+	}
+	if err := os.WriteFile(path, changed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Verify(spec.RunID); !errors.Is(err, ErrIntegrity) {
+		t.Fatalf("Verify error = %v, want ErrIntegrity", err)
+	}
+}
+
+func TestVerifyRejectsDuplicateMonitorAlertIdentity(t *testing.T) {
+	store, err := NewRunStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := testRunSpec("duplicate-monitor-alert")
+	spec.BehaviorBundle.MonitorVersion = monitorVersion
+	writer, err := store.Reserve(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation := MonitorObservation{Sequence: 1, Tick: 1, EventKind: "alert_trigger", Outcome: "observed"}
+	if err := writer.AppendMonitor(MonitorRecord{
+		Kind: MonitorRecordObservation, Tick: 1, Observation: &observation,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	alert := MonitorAlert{
+		SourceSequence: 1, RuleID: "test-rule", RationaleCode: "duplicate_identity",
+		Action: ContainmentAction{Kind: ContainmentPauseActor, ActorID: "agent-a"},
+	}
+	for range 2 {
+		if err := writer.AppendMonitor(MonitorRecord{
+			Kind: MonitorRecordAlert, Tick: 1, AlertID: monitorAlertID(spec.ScenarioID, alert),
+			RuleID: alert.RuleID, RationaleCode: alert.RationaleCode,
+			SourceSequence: alert.SourceSequence, EffectiveTick: 2, Action: &alert.Action,
+			Outcome: "duplicate_suppressed",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	appendNoAction(t, writer, 1)
+	if _, err := writer.Finalize(true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Verify(spec.RunID); !errors.Is(err, ErrIntegrity) {
+		t.Fatalf("Verify error = %v, want ErrIntegrity", err)
 	}
 }
 

@@ -64,7 +64,7 @@ func policyFixture(t *testing.T, workerPolicy Name, workerLimits Limits, removeE
 		RunID: "python-run", ScenarioID: task.ID,
 		Topology: observatory.TopologySharedMessages, Seed: 17,
 		BehaviorBundle: observatory.BehaviorBundle{
-			EngineVersion: "engine-v1", MonitorVersion: "monitor-v1", ContainmentVersion: "containment-v1",
+			EngineVersion: "engine-v1", MonitorVersion: "monitor-disabled-v1", ContainmentVersion: "containment-v1",
 			EvaluatorVersion: "evaluator-v1", PolicyProtocolVersion: "policy-v1", BuildDigest: strings.Repeat("a", 64),
 		},
 		ProtocolVersion: 1, Actors: actors,
