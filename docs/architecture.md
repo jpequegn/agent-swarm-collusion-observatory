@@ -19,7 +19,7 @@ Determinism is guaranteed for the same complete recorded decision trace and beha
 
 ## Local policy boundary
 
-The Go host starts only bundled policies and bounds their protocol messages, output, stderr, execution time, and action budgets. It terminates a policy process group on timeout. These controls do not create an OS sandbox. Arbitrary third-party policy code is not supported and must not be run.
+The Go host starts only bundled policies whose source hash is pinned by the adapter. It uses an isolated Python startup (`-I -S -B`), a minimal explicit environment, and a temporary working directory; it bounds input, output, stderr, execution time, and action budgets. It terminates a policy process group on timeout. The versioned JSONL schema validates actor identity, capabilities, observation fields, proposal kinds, and response shape. These controls do not create an OS sandbox. Arbitrary third-party policy code is not supported and must not be run.
 
 ## UI boundary
 
