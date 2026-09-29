@@ -51,21 +51,25 @@ type VerificationCase struct {
 }
 
 type Task struct {
-	ID                string                                      `json:"id"`
-	InitialFiles      map[string]string                           `json:"initial_files"`
-	ExpectedFiles     map[string]string                           `json:"expected_files"`
-	VerificationFile  string                                      `json:"verification_file"`
-	VerificationCases []VerificationCase                          `json:"verification_cases"`
-	AllowedPaths      []string                                    `json:"allowed_paths"`
-	ReadAccess        map[observatory.ActorID][]string            `json:"read_access"`
-	EditAccess        map[observatory.ActorID][]string            `json:"edit_access"`
-	ReportsTo         map[observatory.ActorID]observatory.ActorID `json:"reports_to"`
-	Artifacts         []Artifact                                  `json:"artifacts,omitempty"`
-	Revocations       []Revocation                                `json:"revocations,omitempty"`
-	ToolCosts         map[observatory.IntentKind]uint64           `json:"tool_costs,omitempty"`
-	RewardRule        RewardRule                                  `json:"reward_rule"`
-	DropMessages      bool                                        `json:"drop_messages,omitempty"`
-	MaxStalledTicks   uint64                                      `json:"max_stalled_ticks,omitempty"`
+	ID                    string                                      `json:"id"`
+	InitialFiles          map[string]string                           `json:"initial_files"`
+	ExpectedFiles         map[string]string                           `json:"expected_files"`
+	VerificationFile      string                                      `json:"verification_file"`
+	VerificationCases     []VerificationCase                          `json:"verification_cases"`
+	AllowedPaths          []string                                    `json:"allowed_paths"`
+	ReadAccess            map[observatory.ActorID][]string            `json:"read_access"`
+	EditAccess            map[observatory.ActorID][]string            `json:"edit_access"`
+	ReportsTo             map[observatory.ActorID]observatory.ActorID `json:"reports_to"`
+	Artifacts             []Artifact                                  `json:"artifacts,omitempty"`
+	Revocations           []Revocation                                `json:"revocations,omitempty"`
+	ToolCosts             map[observatory.IntentKind]uint64           `json:"tool_costs,omitempty"`
+	RewardRule            RewardRule                                  `json:"reward_rule"`
+	ExpectedClass         EvaluationClass                             `json:"expected_class"`
+	DetectionSignalKind   string                                      `json:"detection_signal_kind,omitempty"`
+	DetectionSignalReason string                                      `json:"detection_signal_reason,omitempty"`
+	DetectionRuleID       string                                      `json:"detection_rule_id,omitempty"`
+	DropMessages          bool                                        `json:"drop_messages,omitempty"`
+	MaxStalledTicks       uint64                                      `json:"max_stalled_ticks,omitempty"`
 }
 
 type PairedBenchmark struct {
@@ -138,6 +142,16 @@ func NewPairedBenchmark(task Task, base observatory.RunSpec) (PairedBenchmark, e
 func (t Task) validate(actors []observatory.ActorSpec, limits observatory.RunLimits) error {
 	if !validTaskID(t.ID) || len(t.InitialFiles) == 0 || len(t.ExpectedFiles) == 0 || len(t.InitialFiles)+len(t.ExpectedFiles) > maxFixtureFiles || len(t.AllowedPaths) > maxFixtureFiles || len(t.Artifacts) > maxFixtureArtifacts || len(t.Revocations) > maxFixtureActors*64 || len(t.VerificationCases) == 0 || len(t.VerificationCases) > 16 || t.RewardRule != RewardVerifiedRepair && t.RewardRule != RewardEditActivity {
 		return errors.New("invalid package-repair task definition")
+	}
+	if t.ExpectedClass != EvaluationClassControl && t.ExpectedClass != EvaluationClassBenign && t.ExpectedClass != EvaluationClassAdversarial {
+		return errors.New("task requires an expected behavior class")
+	}
+	if t.ExpectedClass == EvaluationClassAdversarial {
+		if !validTaskID(t.DetectionSignalKind) || !validTaskID(t.DetectionSignalReason) || !validTaskID(t.DetectionRuleID) {
+			return errors.New("adversarial task requires a valid detection signal and rule")
+		}
+	} else if t.DetectionSignalKind != "" || t.DetectionSignalReason != "" || t.DetectionRuleID != "" {
+		return errors.New("non-adversarial task cannot define an adversarial detection signal")
 	}
 	if t.MaxStalledTicks > limits.MaxTicks {
 		return errors.New("stall limit cannot exceed the run tick limit")
