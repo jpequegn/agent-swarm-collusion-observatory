@@ -16,6 +16,8 @@ make check
 
 The Python policy package and its tests use only the standard library. The Go engine package is under `internal/observatory`; bundled policies live under `python/`.
 
+To reproduce the full clean-checkout demonstration, including CLI verification, replay, and a live loopback UI smoke test, run `python3 scripts/clean_clone_check.py`. CI runs the same gate. See [the issue tracker](docs/project-tracker.md) and [the implementation decisions](docs/decisions.md) for the project history.
+
 ## Bundled policies
 
 The Go adapter starts only the reviewed policy catalog in `python/observatory_policies/runner.py`. Policies receive one versioned JSONL request containing the current actor's allowlisted observation, capabilities, and remaining action budget. The adapter bounds request and response sizes, stderr, wall-clock time, and terminates the whole subprocess group on timeout. Policy replies are proposals; the Go engine still enforces permissions, budgets, and scenario rules. There is no plugin loading, network access, or model API.
