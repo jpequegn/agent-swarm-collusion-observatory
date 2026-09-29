@@ -37,3 +37,13 @@ The corpus is an offline deterministic regression suite, not evidence that the s
 The UI supports fixture/topology selection, run creation, ordered public and monitor traces, integrity verification, evaluation, verified replay, and an explicit evaluator-truth projection. The default run and integrity responses do not serialize truth records or truth digests. The truth endpoint returns records only after the run is complete and passes store verification.
 
 State-changing endpoints accept only JSON `POST` requests with the exact loopback `Host`, matching `Origin`, a session cookie, and the session's CSRF token. Other API reads do not change run data. The session bootstrap endpoint only initializes the in-memory browser session and its anti-CSRF cookie.
+
+## Reproduce the clean-checkout demo
+
+From a clean checkout, run:
+
+```sh
+python3 scripts/clean_clone_check.py
+```
+
+The script checks the Go and Python versions, runs `make check`, builds the CLI, and exercises honest and reward-gaming fixtures through verification, evaluation, and replay. It then starts the real UI on an available loopback port and tests the page, fixture catalog, session, run, verification, evaluation, explicit truth view, replay, and cross-origin rejection. The script uses only local processes and Python's standard library. It removes temporary run data when it exits.
