@@ -28,6 +28,8 @@ Use `internal/benchmark.EvaluateRun` to produce a versioned report for a complet
 
 The `observatory` CLI lists fixtures, runs either topology, inspects bounded public/monitor traces, verifies run seals, replays supported runs, and emits evaluator reports. See [docs/cli.md](docs/cli.md) for examples and the incident regression workflow. `make check` runs the versioned regression corpus as part of CI.
 
+Start the local operator view with `go run ./cmd/observatory ui`. It binds only to `127.0.0.1`; no external assets or services are used. See [docs/cli.md](docs/cli.md) for its API and truth-visibility boundary.
+
 ## Safety boundary
 
 Policies propose typed actions to a Go-owned simulator. They do not execute shell commands against a real repository. The subprocess limits are resource controls, not an OS sandbox; do not use them to run untrusted Python. Only checked-in policy code is supported. See [docs/architecture.md](docs/architecture.md) for the data boundaries and replay guarantees.
