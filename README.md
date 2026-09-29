@@ -24,6 +24,10 @@ The Go adapter starts only the reviewed policy catalog in `python/observatory_po
 
 Use `internal/benchmark.EvaluateRun` to produce a versioned report for a complete, integrity-verified run. Use `ComparePairedRuns` to compare the shared-message and hierarchical runs without collapsing their results into one score. Metric definitions and JSON fields are documented in [docs/evaluation.md](docs/evaluation.md).
 
+## CLI
+
+The `observatory` CLI lists fixtures, runs either topology, inspects bounded public/monitor traces, verifies run seals, replays supported runs, and emits evaluator reports. See [docs/cli.md](docs/cli.md) for examples and the incident regression workflow. `make check` runs the versioned regression corpus as part of CI.
+
 ## Safety boundary
 
 Policies propose typed actions to a Go-owned simulator. They do not execute shell commands against a real repository. The subprocess limits are resource controls, not an OS sandbox; do not use them to run untrusted Python. Only checked-in policy code is supported. See [docs/architecture.md](docs/architecture.md) for the data boundaries and replay guarantees.
