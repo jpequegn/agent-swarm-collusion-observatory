@@ -21,6 +21,7 @@ Commands:
   replay    replay a run with the exact supported behavior bundle
   evaluate  score a complete, integrity-verified run
   regress   execute the versioned incident regression corpus
+  ui        serve the local operator UI on loopback
 `
 
 var errHelpRequested = errors.New("help requested")
@@ -46,6 +47,8 @@ func Run(args []string, stdout, stderr io.Writer) error {
 		err = evaluateCommand(args[1:], stdout, stderr)
 	case "regress":
 		err = regressCommand(args[1:], stdout, stderr)
+	case "ui":
+		err = uiCommand(args[1:], stderr)
 	default:
 		return fmt.Errorf("unknown command %q\n%s", args[0], usage)
 	}

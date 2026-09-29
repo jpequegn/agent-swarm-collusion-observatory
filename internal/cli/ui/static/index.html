@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Agent Swarm Observatory</title>
+  <link rel="stylesheet" href="/ui.css">
+  <script src="/ui.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">AO</span>
+      <div>
+        <h1>Agent Swarm Observatory</h1>
+        <p>Local incident lab</p>
+      </div>
+    </div>
+    <div class="runtime-state"><span class="state-dot"></span><span>LOOPBACK ONLY</span><span class="divider">/</span><span>OFFLINE</span></div>
+  </header>
+
+  <main>
+    <section class="control-strip" aria-label="Run controls">
+      <div class="field fixture-field">
+        <label for="fixture">Fixture</label>
+        <select id="fixture" name="fixture"></select>
+      </div>
+      <fieldset class="field topology-field">
+        <legend>Topology</legend>
+        <div class="segmented">
+          <label><input type="radio" name="topology" value="shared_messages" checked><span>Shared messages</span></label>
+          <label><input type="radio" name="topology" value="hierarchical"><span>Hierarchical</span></label>
+        </div>
+      </fieldset>
+      <div class="field policy-field">
+        <label for="worker-policy">Worker policy</label>
+        <select id="worker-policy" name="worker-policy">
+          <option value="honest_repair">Honest repair</option>
+          <option value="no_action">No action</option>
+          <option value="duplicate_inspector">Duplicate inspector</option>
+          <option value="reward_gamer">Reward gamer</option>
+        </select>
+      </div>
+      <button class="button primary" id="start-run" type="button">Start run</button>
+      <div class="load-run">
+        <label class="visually-hidden" for="run-id-input">Run ID</label>
+        <input id="run-id-input" type="text" autocomplete="off" spellcheck="false" placeholder="Open run ID">
+        <button class="button secondary" id="open-run" type="button">Open</button>
+      </div>
+    </section>
+
+    <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+
+    <section class="run-heading" aria-label="Selected run">
+      <div>
+        <p class="eyebrow">SELECTED RUN</p>
+        <h2 id="run-title">No run selected</h2>
+      </div>
+      <div id="run-badges" class="run-badges"></div>
+    </section>
+
+    <div class="workspace">
+      <section class="trace-column" aria-label="Run trace">
+        <section class="trace-section">
+          <div class="section-heading">
+            <h3>Public events</h3>
+            <span id="public-count" class="count">0</span>
+          </div>
+          <ol id="public-events" class="event-list empty-state"><li>Run a fixture to inspect its public trace.</li></ol>
+        </section>
+        <section class="trace-section">
+          <div class="section-heading">
+            <h3>Monitor decisions</h3>
+            <span id="monitor-count" class="count">0</span>
+          </div>
+          <ol id="monitor-events" class="event-list empty-state"><li>Monitor observations and containment actions appear here.</li></ol>
+        </section>
+      </section>
+
+      <aside class="detail-column" aria-label="Run details">
+        <section class="detail-section">
+          <div class="section-heading">
+            <h3>Run integrity</h3>
+            <button id="verify-run" class="button small secondary" type="button" disabled>Verify</button>
+          </div>
+          <dl id="integrity-details" class="key-values"><div><dt>Status</dt><dd>Not checked</dd></div></dl>
+        </section>
+
+        <section class="detail-section">
+          <div class="section-heading">
+            <h3>Evaluation</h3>
+            <button id="evaluate-run" class="button small secondary" type="button" disabled>Evaluate</button>
+          </div>
+          <div id="evaluation-details" class="placeholder">Evaluation is available after integrity verification.</div>
+        </section>
+
+        <section class="detail-section">
+          <div class="section-heading">
+            <h3>Replay</h3>
+            <button id="replay-run" class="button small secondary" type="button" disabled>Replay</button>
+          </div>
+          <div id="replay-details" class="placeholder">A replay uses the verified decision trace and matching behavior bundle.</div>
+        </section>
+
+        <section class="detail-section truth-section">
+          <div class="section-heading">
+            <h3>Evaluator truth</h3>
+            <button id="show-truth" class="button small warning" type="button" disabled>Show truth</button>
+          </div>
+          <div id="truth-details" class="placeholder">Hidden until explicitly requested for a complete verified run.</div>
+        </section>
+      </aside>
+    </div>
+    <footer>Agent Swarm Collusion Observatory <span>|</span> synthetic runs only</footer>
+  </main>
+</body>
+</html>
